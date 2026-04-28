@@ -3,3 +3,4 @@ plotly
 networkx
 pyvis
 regex
+sqlglot

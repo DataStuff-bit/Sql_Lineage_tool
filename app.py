@@ -3,6 +3,7 @@ import math
 import streamlit as st
 import networkx as nx
 import regex as re
+import sqlglot
 from analyzer.parser import parse_query
 from analyzer.cte_extractor import extract_ctes
 from analyzer.dependency import build_dependencies
