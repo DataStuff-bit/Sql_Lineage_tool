@@ -1,0 +1,5 @@
+sqlglot
+streamlit
+networkx
+pandas
+pyvis
