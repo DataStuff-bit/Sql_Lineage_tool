@@ -203,16 +203,18 @@ def draw_dependency_graph(
     dependencies: Dict[str, List[str]],
     highlight_nodes: Set[str] = None,
     matched_nodes: Set[str] = None,
+    duplicate_nodes: Set[str] = None,
 ) -> go.Figure:
     """
     Interactive Plotly dependency graph.
-    When highlight_nodes / matched_nodes are provided:
-      🟡 matched_nodes  = direct column match (yellow)
+    When highlight_nodes / matched_nodes / duplicate_nodes are provided:
+      🟡 matched_nodes or duplicate_nodes  = direct column match / duplicate risk
       🔵/🟢 highlight_nodes = ancestors/descendants (normal colour)
       🩶 everything else  = dimmed grey
     """
     highlight_nodes = highlight_nodes or set()
     matched_nodes   = matched_nodes   or set()
+    duplicate_nodes = duplicate_nodes or set()
 
     G = create_graph(dependencies)
 
@@ -233,23 +235,26 @@ def draw_dependency_graph(
     source_nodes    = all_nodes - dependent_nodes
     in_deg          = dict(G.in_degree())
     out_deg         = dict(G.out_degree())
-    searching       = bool(highlight_nodes or matched_nodes)
+    searching       = bool(highlight_nodes or matched_nodes or duplicate_nodes)
 
     def node_color(n):
-        if n in matched_nodes:
+        if n in matched_nodes or n in duplicate_nodes:
             return "#F59E0B"
         if not searching or n in highlight_nodes:
             return "#3B82F6" if n in source_nodes else "#10B981"
         return "#CBD5E1"  # dimmed
 
     def node_opacity(n):
-        if not searching or n in highlight_nodes or n in matched_nodes:
+        if not searching or n in highlight_nodes or n in matched_nodes or n in duplicate_nodes:
             return 1.0
         return 0.25
 
     def edge_style(u, v):
         in_sub = u in highlight_nodes and v in highlight_nodes
-        is_hot = u in matched_nodes   or  v in matched_nodes
+        is_hot = (
+            u in matched_nodes or v in matched_nodes
+            or u in duplicate_nodes or v in duplicate_nodes
+        )
         if not searching:
             return "#94A3B8", 1.2
         if in_sub and is_hot:
@@ -352,6 +357,7 @@ def interactive_graph(
     output_path: Optional[str] = None,
     highlight_nodes: Set[str] = None,
     matched_nodes: Set[str] = None,
+    duplicate_nodes: Set[str] = None,
     cte_sql_map: Dict[str, str] = None,   # ✅ preferred
     ctes: Dict[str, any] = None,          # ✅ optional fallback
     search_column: str = None
@@ -366,7 +372,8 @@ def interactive_graph(
     """
     highlight_nodes = highlight_nodes or set()
     matched_nodes   = matched_nodes   or set()
-    searching       = bool(highlight_nodes or matched_nodes)
+    duplicate_nodes = duplicate_nodes or set()
+    searching       = bool(highlight_nodes or matched_nodes or duplicate_nodes)
 
     G = create_graph(dependencies)
     dependent_nodes = set(dependencies.keys())
@@ -410,7 +417,7 @@ def interactive_graph(
                     node,
                     G,
                     kind,
-                    cte_sql_map=None,
+                    cte_sql_map=cte_sql_map,
                     search_column=search_column,
             ),
             shape="box" if kind in ("cte", "terminal") else "ellipse",
@@ -435,7 +442,10 @@ def interactive_graph(
     # ── Edges ────────────────────────────────────────────────
     for source, target in G.edges():
         in_sub = source in highlight_nodes and target in highlight_nodes
-        is_hot = source in matched_nodes   or  target in matched_nodes
+        is_hot = (
+            source in matched_nodes or target in matched_nodes
+            or source in duplicate_nodes or target in duplicate_nodes
+        )
 
         if not searching:
             color, width = COLORS["edge"], 1.5

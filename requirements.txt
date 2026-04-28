@@ -1,5 +1,5 @@
-sqlglot
 streamlit
+plotly
 networkx
-pandas
 pyvis
+regex

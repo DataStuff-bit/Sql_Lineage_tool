@@ -59,7 +59,55 @@ def get_dependency_subgraph(G: nx.DiGraph, highlight_ctes: set[str]) -> set[str]
     return related
 
 
-def draw_highlighted_graph(deps: dict, highlight_nodes: set[str], matched_nodes: set[str]):
+def find_duplicate_ctes(lineage: dict, cte_sql_map: dict[str, str]) -> tuple[set[str], dict[str, list[str]]]:
+    duplicate_ctes: set[str] = set()
+    duplicate_notes: dict[str, list[str]] = {}
+
+    # Same output alias repeated in one CTE
+    for cte, cols in lineage.items():
+        alias_counts: dict[str, int] = {}
+        for col in cols:
+            output = str(col.get("output", "")).strip().lower()
+            if not output:
+                continue
+            alias_counts[output] = alias_counts.get(output, 0) + 1
+        for alias, count in alias_counts.items():
+            if count > 1:
+                duplicate_ctes.add(cte)
+                duplicate_notes.setdefault(cte, []).append(
+                    f"Column alias `{alias}` appears {count} times in `{cte}`."
+                )
+
+    # Same output alias across multiple CTEs
+    output_map: dict[str, set[str]] = {}
+    for cte, cols in lineage.items():
+        for col in cols:
+            output = str(col.get("output", "")).strip().lower()
+            if not output:
+                continue
+            output_map.setdefault(output, set()).add(cte)
+
+    for output, ctes_with_output in output_map.items():
+        if len(ctes_with_output) > 1:
+            note = (
+                f"Output column `{output}` is produced by multiple CTEs: "
+                + ", ".join(sorted(ctes_with_output))
+            )
+            for cte in ctes_with_output:
+                duplicate_ctes.add(cte)
+                duplicate_notes.setdefault(cte, []).append(note)
+
+    # SQL-level duplicate/excessive join risk
+    for cte, sql in cte_sql_map.items():
+        risk = detect_duplicate_risk(sql)
+        if risk:
+            duplicate_ctes.add(cte)
+            duplicate_notes.setdefault(cte, []).append(risk)
+
+    return duplicate_ctes, duplicate_notes
+
+
+def draw_highlighted_graph(deps: dict, highlight_nodes: set[str], matched_nodes: set[str], duplicate_nodes: set[str] = None):
     """
     Wrapper around draw_dependency_graph that injects highlight colours.
     highlight_nodes = ancestors + descendants (dimmed-but-visible)
@@ -95,19 +143,23 @@ def draw_highlighted_graph(deps: dict, highlight_nodes: set[str], matched_nodes:
     in_deg = dict(G.in_degree())
     out_deg = dict(G.out_degree())
 
+    duplicate_nodes = duplicate_nodes or set()
+
     def node_color(n):
-        if n in matched_nodes:
-            return "#F59E0B"          # 🟡 direct column match
+        if n in matched_nodes or n in duplicate_nodes:
+            return "#F59E0B"          # 🟡 direct column match / duplicate risk
         if n in highlight_nodes:
             return "#3B82F6" if n in source_nodes else "#10B981"  # normal colours
         return "#CBD5E1"              # 🩶 dimmed — not in subgraph
 
     def node_opacity(n):
-        return 1.0 if (n in matched_nodes or n in highlight_nodes or not highlight_nodes) else 0.25
+        return 1.0 if (n in matched_nodes or n in duplicate_nodes or n in highlight_nodes or not highlight_nodes) else 0.25
 
     def edge_color(u, v):
         if u in highlight_nodes and v in highlight_nodes:
-            return "#F59E0B" if (u in matched_nodes or v in matched_nodes) else "#64748B"
+            return "#F59E0B" if (
+                u in matched_nodes or v in matched_nodes or u in duplicate_nodes or v in duplicate_nodes
+            ) else "#64748B"
         return "#E2E8F0"
 
     def edge_width(u, v):
@@ -209,6 +261,7 @@ try:
         for name, expr in ctes.items()
     }
     lineage, final_lineage = build_lineage(ctes, parsed)
+    duplicate_ctes, duplicate_notes = find_duplicate_ctes(lineage, cte_sql_map)
 
 except Exception as e:
     st.error("Error parsing SQL query")
@@ -282,7 +335,7 @@ try:
     # Highlight matched nodes in the flow string
     flow_parts = []
     for node in execution_order:
-        if node in matched_ctes:
+        if node in matched_ctes or node in duplicate_ctes:
             flow_parts.append(f"**:orange[{node}]**")
         elif node in subgraph_nodes:
             flow_parts.append(f"**{node}**")
@@ -298,8 +351,8 @@ st.markdown("---")
 # TABS
 # ═══════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3 , tab4, tab5 ,tab6= st.tabs(
-    ["📌 CTE Breakdown", "🔗 Dependency Graph", "🧬 Column Lineage","🔗 Column Paths", "🧭 Column Dependency","Getting Number Of rows for Each CTE (Q)"])
+tab1, tab2, tab3 , tab4, tab5 ,tab6, tab7 = st.tabs(
+    ["📌 CTE Breakdown", "🔗 Dependency Graph", "🧬 Column Lineage","🔗 Column Paths", "🧭 Column Dependency","Getting Number Of rows for Each CTE (Q)", "🛠 Debugger"])
 
 # ── TAB 1: CTE Breakdown ────────────────────────────────────
 with tab1:
@@ -372,8 +425,14 @@ with tab2:
                 "🩶 Grey = unrelated"
             )
 
+        if duplicate_ctes:
+            st.warning(
+                "🟠 **Orange** = duplicate-risk CTEs or repeated columns detected. "
+                "These nodes are also highlighted in the debugger tab."
+            )
+
         if graph_mode == "Static (Plotly)":
-            fig = draw_highlighted_graph(deps, subgraph_nodes, matched_ctes)
+            fig = draw_highlighted_graph(deps, subgraph_nodes, matched_ctes, duplicate_ctes)
             st.plotly_chart(fig, use_container_width=True)
 
         else:
@@ -381,11 +440,12 @@ with tab2:
             from utils.graph import interactive_graph
             html_path = interactive_graph(
                 deps,
-                ctes=ctes,   
+                ctes=ctes,
                 cte_sql_map=cte_sql_map,       # 👈 ADD THIS
                 search_column=column_search,   # 👈 ADD THIS
                 highlight_nodes=subgraph_nodes,
                 matched_nodes=matched_ctes,
+                duplicate_nodes=duplicate_ctes,
             )
             with open(html_path, "r", encoding="utf-8") as f:
                 st.components.v1.html(f.read(), height=680, scrolling=False)
@@ -576,6 +636,72 @@ with tab5:
                         risk = detect_duplicate_risk(sql)
                         if risk:
                             st.warning(risk)
+
+with tab7:
+    st.subheader("🛠 Debugger — packet your query columns and duplicate risk")
+
+    if not column_search:
+        st.info("Search a column in the left panel to inspect which CTEs contain it and where duplicate risk shows up.")
+    else:
+        if matched_ctes:
+            st.markdown(
+                f"**Tracked column:** `{column_search}` appears in {len(matched_ctes)} CTE(s): "
+                + ", ".join(f"`{cte}`" for cte in sorted(matched_ctes))
+            )
+        else:
+            st.warning(f"No CTEs contain `{column_search}`.")
+
+        if duplicate_ctes:
+            st.markdown("### 🟠 Duplicate risk candidates")
+            for cte in sorted(duplicate_ctes):
+                notes = duplicate_notes.get(cte, [])
+                st.markdown(f"- `{cte}`")
+                for note in notes:
+                    st.markdown(f"  - {note}")
+        else:
+            st.success("No obvious duplicate-risk CTEs or repeated output columns detected.")
+
+        st.markdown("---")
+        st.markdown("### 🧠 Column debugger output")
+
+        for cte, cols in lineage.items():
+            matches = [
+                col for col in cols
+                if column_search.lower() in col.get("output", "").lower()
+                or any(column_search.lower() in str(s).lower() for s in col.get("sources", []))
+            ]
+            if not matches:
+                continue
+            st.markdown(f"#### `{cte}`")
+            for col in matches:
+                st.markdown(f"- `{col['output']}` ← {col['sources']}")
+            if cte in cte_sql_map:
+                with st.expander(f"📄 Query SQL for `{cte}`"):
+                    sql = highlight_column(cte_sql_map[cte], column_search)
+                    st.code(sql, language="sql")
+                    risk = detect_duplicate_risk(sql)
+                    if risk:
+                        st.warning(risk)
+                    joins = extract_joins(cte_sql_map[cte])
+                    if joins:
+                        st.markdown("**Joins detected:**")
+                        for j in joins:
+                            st.code(j, language="sql")
+
+    if duplicate_ctes:
+        st.markdown("---")
+        st.markdown("### 🔶 Interactive graph highlights duplicate risk in orange")
+        html_path = interactive_graph(
+            deps,
+            ctes=ctes,
+            cte_sql_map=cte_sql_map,
+            search_column=column_search,
+            highlight_nodes=subgraph_nodes,
+            matched_nodes=matched_ctes,
+            duplicate_nodes=duplicate_ctes,
+        )
+        with open(html_path, "r", encoding="utf-8") as f:
+            st.components.v1.html(f.read(), height=680, scrolling=False)
 
 with tab6:
     st.set_page_config(page_title="CTE Row Counter", page_icon="📊", layout="wide")
