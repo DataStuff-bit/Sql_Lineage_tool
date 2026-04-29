@@ -1039,76 +1039,152 @@ with tab7:
                     st.write(f"**{cte}**: {', '.join(duplicate_notes[cte])}")
 
 
-# ── TAB 8: Cross-File CTE Tracker ─────────────────────────────
+import streamlit as st
+from pathlib import Path
+import zipfile
+import io
+
+# ================================
+# 🔍 Helpers
+# ================================
+
+def scan_uploaded_files(files):
+    registry = {}
+
+    for file in files:
+        content = file.read().decode("utf-8")
+        file_name = file.name
+
+        ctes = extract_ctes(content)  # <-- your function
+
+        for cte_name, cte_info in ctes.items():
+            registry[cte_name.lower()] = {
+                "file": file_name,
+                "line": cte_info["line"],
+                "body": cte_info["body"]
+            }
+
+    return registry
+
+
+def scan_zip(zip_file):
+    registry = {}
+
+    with zipfile.ZipFile(io.BytesIO(zip_file.read())) as z:
+        for name in z.namelist():
+            if name.endswith(".sql"):
+                content = z.read(name).decode("utf-8")
+
+                ctes = extract_ctes(content)
+
+                for cte_name, cte_info in ctes.items():
+                    registry[cte_name.lower()] = {
+                        "file": name,
+                        "line": cte_info["line"],
+                        "body": cte_info["body"]
+                    }
+
+    return registry
+
+
+# ================================
+# 📁 TAB 8 UI
+# ================================
+
 with tab8:
     st.subheader("📁 Cross-File CTE Tracker")
+
     st.caption(
-        "Point to a folder of `.sql` files — the tool scans all of them, "
-        "builds a global CTE registry, and lets you trace any CTE across files."
+        "Upload SQL files or a ZIP folder — the tool builds a global CTE registry "
+        "and lets you trace dependencies across files."
     )
 
-    # ── Folder input ─────────────────────────────────────────
-    folder_path = st.text_input(
-        "SQL folder path",
-        placeholder=r"C:\Users\you\project\sql_files",
-        help="Absolute path to the folder containing your .sql files. Subfolders are included.",
+    # ── Upload Mode ─────────────────────────────
+    upload_mode = st.radio(
+        "Choose input method",
+        ["Upload SQL files", "Upload ZIP folder"]
     )
 
-    if not folder_path:
-        st.info("Enter a folder path above to start scanning.")
-        st.stop()
+    registry = {}
 
-    if not Path(folder_path).exists():
-        st.error(f"❌ Folder not found: `{folder_path}`")
-        st.stop()
+    # ── Option 1: Multiple files ────────────────
+    if upload_mode == "Upload SQL files":
+        uploaded_files = st.file_uploader(
+            "Upload .sql files",
+            type=["sql"],
+            accept_multiple_files=True
+        )
 
-    # ── Scan ─────────────────────────────────────────────────
-    registry   = scan_folder(folder_path)
+        st.caption("💡 Tip: Select all files from a folder (Ctrl+A)")
+
+        if not uploaded_files:
+            st.info("Upload .sql files to continue")
+            st.stop()
+
+        registry = scan_uploaded_files(uploaded_files)
+
+    # ── Option 2: ZIP ──────────────────────────
+    else:
+        zip_file = st.file_uploader("Upload ZIP file", type=["zip"])
+
+        if not zip_file:
+            st.info("Upload a ZIP file to continue")
+            st.stop()
+
+        registry = scan_zip(zip_file)
+
+    # ── Build dependencies ─────────────────────
     cross_deps = build_cross_file_deps(registry)
 
     if not registry:
-        st.warning("No CTEs found in any .sql file in that folder.")
+        st.warning("No CTEs found.")
         st.stop()
 
-    # ── Summary metrics ──────────────────────────────────────
+    # ── Summary ────────────────────────────────
     all_files = sorted({info["file"] for info in registry.values()})
+
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total CTEs",  len(registry))
-    m2.metric("Files scanned", len(all_files))
-    m3.metric("Cross-file deps",
-              sum(len(d["depends_on"]) for d in cross_deps.values()))
+    m1.metric("Total CTEs", len(registry))
+    m2.metric("Files", len(all_files))
+    m3.metric("Dependencies", sum(len(d["depends_on"]) for d in cross_deps.values()))
 
     st.markdown("---")
 
-    # ── Two-panel layout ─────────────────────────────────────
+    # ── Layout ─────────────────────────────────
     left_col, right_col = st.columns([1, 2])
 
+    # ================= LEFT PANEL =================
     with left_col:
-        st.markdown("#### 🔎 Search a CTE")
+        st.markdown("#### 🔎 Search CTE")
+
         cte_search = st.selectbox(
-            "CTE name",
+            "CTE",
             options=[""] + sorted(registry.keys()),
-            format_func=lambda x: "— pick a CTE —" if x == "" else x,
-            label_visibility="collapsed",
+            format_func=lambda x: "— Select CTE —" if x == "" else x,
+            label_visibility="collapsed"
         )
 
-        st.markdown("#### 📂 Files in registry")
+        st.markdown("#### 📂 Files")
+
         for f in all_files:
             fname = Path(f).name
             ctes_in_file = [n for n, info in registry.items() if info["file"] == f]
-            with st.expander(f"📄 {fname}  ({len(ctes_in_file)} CTEs)"):
+
+            with st.expander(f"📄 {fname} ({len(ctes_in_file)})"):
                 for cte in sorted(ctes_in_file):
                     is_target = cte == (cte_search or "").lower()
                     prefix = "🟡" if is_target else "•"
+
                     st.markdown(
                         f"{prefix} `{cte}` — line {registry[cte]['line']}"
                     )
 
+    # ================= RIGHT PANEL =================
     with right_col:
+
         if not cte_search:
-            # Show full cross-file dependency graph
-            st.markdown("#### 🗺 Full Cross-File Dependency Graph")
-            st.caption("Select a CTE on the left to highlight it.")
+            st.markdown("#### 🗺 Full Dependency Graph")
+
             fig = draw_cross_file_graph(cross_deps)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1118,61 +1194,65 @@ with tab8:
             if "error" in result:
                 st.error(result["error"])
             else:
-                # ── Where defined ─────────────────────────
-                st.markdown("#### 📍 Defined in")
                 fname = Path(result["defined_in"]).name
-                st.code(f"{fname}  →  line {result['line']}")
 
-                # ── Depends on ────────────────────────────
-                st.markdown(f"#### 🔗 Depends on  `({len(result['depends_on'])})`")
+                # ── Defined in ─────────────────
+                st.markdown("#### 📍 Defined in")
+                st.code(f"{fname} → line {result['line']}")
+
+                # ── Depends on ────────────────
+                st.markdown(f"#### 🔗 Depends on ({len(result['depends_on'])})")
+
                 if result["depends_on"]:
                     for dep in result["depends_on"]:
                         dep_file = Path(dep["file"]).name
                         same = dep_file == fname
                         icon = "📄" if same else "📁"
+
                         st.markdown(
-                            f"- {icon} `{dep['cte']}` ← "
-                            f"`{dep_file}` line {dep['line']}"
+                            f"- {icon} `{dep['cte']}` ← `{dep_file}` line {dep['line']}"
                             + (" *(same file)*" if same else " *(cross-file)*")
                         )
                 else:
-                    st.success("✅ No dependencies — this is a base/source CTE")
+                    st.success("No dependencies (base CTE)")
 
-                # ── Used by ───────────────────────────────
-                st.markdown(f"#### 🔜 Used by  `({len(result['used_by'])})`")
+                # ── Used by ───────────────────
+                st.markdown(f"#### 🔜 Used by ({len(result['used_by'])})")
+
                 if result["used_by"]:
                     for dep in result["used_by"]:
                         dep_file = Path(dep["file"]).name
                         same = dep_file == fname
                         icon = "📄" if same else "📁"
+
                         st.markdown(
-                            f"- {icon} `{dep['cte']}` in "
-                            f"`{dep_file}` line {dep['line']}"
+                            f"- {icon} `{dep['cte']}` in `{dep_file}`"
                             + (" *(same file)*" if same else " *(cross-file)*")
                         )
                 else:
-                    st.info("Not referenced by any other CTE — this may be a terminal/final CTE.")
+                    st.info("Terminal CTE (not used further)")
 
-                # ── Full chain ────────────────────────────
-                st.markdown(f"#### 🛣 Full ancestry chain  `({len(result['full_chain'])} nodes)`")
+                # ── Chain ─────────────────────
+                st.markdown("#### 🛣 Full Lineage Chain")
+
                 for i, node in enumerate(result["full_chain"], 1):
                     node_file = Path(node["file"]).name
-                    cross     = node_file != fname
-                    icon      = "📁" if cross else "📄"
+                    cross = node_file != fname
+                    icon = "📁" if cross else "📄"
+
                     st.markdown(
-                        f"`{i}.` {icon} **`{node['cte']}`** "
-                        f"← `{node_file}` line {node['line']}"
-                        + (" 🔀 *cross-file*" if cross else "")
+                        f"{i}. {icon} `{node['cte']}` ← `{node_file}`"
                     )
 
                 st.markdown("---")
 
-                # ── Highlighted graph ─────────────────────
-                st.markdown("#### 🗺 Dependency Graph (highlighted)")
+                # ── Graph ─────────────────────
+                st.markdown("#### 🗺 Highlighted Graph")
+
                 fig = draw_cross_file_graph(cross_deps, highlight=cte_search)
                 st.plotly_chart(fig, use_container_width=True)
 
-                # ── CTE body ──────────────────────────────
+                # ── SQL Body ──────────────────
                 if cte_search in registry:
-                    with st.expander(f"📄 SQL body of `{cte_search}`"):
+                    with st.expander(f"📄 SQL of `{cte_search}`"):
                         st.code(registry[cte_search]["body"], language="sql")
