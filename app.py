@@ -1,9 +1,18 @@
+import os
+import json
+import uuid
+import tempfile
+import requests
+from pathlib import Path
 import plotly.graph_objects as go
 import math
 import streamlit as st
 import networkx as nx
 import regex as re
+from dotenv import load_dotenv
+import os
 
+load_dotenv()  # Load environment variables from .env file
 # ── Must be FIRST Streamlit call ────────────────────────────
 st.set_page_config(
     layout="wide",
@@ -202,6 +211,196 @@ def find_duplicate_ctes(
             duplicate_notes.setdefault(cte, []).append(risk)
 
     return duplicate_ctes, duplicate_notes
+
+
+def build_ai_documents(
+    column_search: str,
+    query: str,
+    cte_sql_map: dict[str, str],
+    lineage: dict,
+    final_lineage: list[dict],
+    deps: dict,
+    duplicate_notes: dict[str, list[str]],
+) -> list[dict]:
+    docs = []
+
+    docs.append({
+        "id": "query",
+        "title": "Original SQL query",
+        "text": query.strip(),
+    })
+
+    for cte, sql in cte_sql_map.items():
+        cols = lineage.get(cte, [])
+        docs.append({
+            "id": f"cte:{cte}",
+            "title": f"CTE {cte}",
+            "text": (
+                f"CTE {cte}\nSQL:\n{sql.strip()}\n\n"
+                + "Columns:\n"
+                + "\n".join(
+                    f"- {col.get('output')} <- {col.get('sources')}" for col in cols
+                )
+                + ("\n\nNotes:\n" + "\n".join(duplicate_notes.get(cte, [])) if duplicate_notes.get(cte) else "")
+            ),
+        })
+
+    deps_text = "\n".join(
+        f"{cte} depends on {', '.join(sorted(parents)) or 'none'}"
+        for cte, parents in deps.items()
+    )
+    docs.append({
+        "id": "dependencies",
+        "title": "Dependency graph summary",
+        "text": deps_text,
+    })
+
+    final_text = "\n".join(
+        f"- {col.get('output')} <- {col.get('sources')}" for col in final_lineage
+    )
+    docs.append({
+        "id": "final_lineage",
+        "title": "Final output lineage",
+        "text": final_text,
+    })
+
+    if column_search:
+        docs.append({
+            "id": "column_search",
+            "title": f"Column search term: {column_search}",
+            "text": f"Search term: {column_search}",
+        })
+
+    return docs
+
+
+def retrieve_relevant_documents(documents: list[dict], query_text: str, top_k: int = 5) -> list[dict]:
+    if not documents:
+        return []
+    
+    try:
+        import chromadb
+        from sentence_transformers import SentenceTransformer
+        
+        # Use ephemeral client to avoid directory lock issues
+        client = chromadb.EphemeralClient()
+        collection = client.create_collection(name="sql_lineage_temp")
+
+        texts = [doc["text"] for doc in documents]
+        ids = [doc["id"] for doc in documents]
+        metadatas = [{"title": doc["title"]} for doc in documents]
+
+        # Add documents (Chroma handles default embedding if model isn't provided, 
+        # but manual embedding ensures consistency)
+        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        embeddings = embedding_model.encode(texts).tolist()
+
+        collection.add(
+            ids=ids,
+            documents=texts,
+            metadatas=metadatas,
+            embeddings=embeddings
+        )
+
+        query_emb = embedding_model.encode([query_text]).tolist()
+        results = collection.query(query_embeddings=query_emb, n_results=min(top_k, len(documents)))
+        
+        selected_ids = results.get("ids", [[]])[0]
+        return [doc for doc in documents if doc["id"] in selected_ids]
+    except Exception as e:
+        # Fallback to simple slice if Chroma/SentenceTransformers fail
+        return documents[:top_k]
+
+def build_ai_prompt(
+    column_search: str,
+    query: str,
+    docs: list[dict],
+    duplicate_notes: dict[str, list[str]],
+) -> str:
+    rules = (
+        "Rules for diagnosis:\n"
+        "1. Detect repeated column aliases inside the same CTE.\n"
+        "2. Detect the same output column produced by multiple CTEs.\n"
+        "3. Highlight JOINs without GROUP BY or DISTINCT and possible duplicate row risk.\n"
+        "4. Identify mismatched column propagation across CTE boundaries.\n"
+        "5. Note syntax or logic issues that could cause incorrect lineage or duplicated values.\n"
+        "6. Prefer concise, actionable guidance that points to the likely CTE and SQL fragment.\n"
+    )
+
+    doc_text = "\n\n---\n\n".join(f"{doc['title']}:\n{doc['text']}" for doc in docs)
+    prompt = (
+        "You are an expert SQL lineage and CTE debugging assistant.\n"
+        f"The user is searching for column: {column_search!r}.\n"
+        "Review the SQL query, CTE definitions, dependency graph, and duplicate risk signals.\n"
+        "Use the available documents and apply the rules below.\n\n"
+        f"{rules}\n\n"
+        f"Documents:\n{doc_text}\n\n"
+        "Provide:\n"
+        "- The most likely CTE or expression causing the issue.\n"
+        "- Whether the problem is a duplicate-risk logic bug, a column alias mismatch, or a syntax/aggregation issue.\n"
+        "- A short recommendation for what to inspect or fix next.\n"
+        "If you do not have enough information, say so clearly."
+    )
+    return prompt
+
+
+def call_gemini_api(prompt: str, model: str = "gemini-2.5-flash", api_key: str = None) -> str:
+    # 1. Get the API key
+    api_key = api_key or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Gemini API key is missing.")
+
+    # 2. Correct Endpoint (Note the 'key=' query param)
+    # Recommended: use 'gemini-1.5-flash' or 'gemini-1.5-flash-latest'
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    headers = {"Content-Type": "application/json"}
+
+    # 3. Correct Payload Structure for v1beta
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 1000,
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    
+    if response.status_code != 200:
+        return f"Error {response.status_code}: {response.text}"
+
+    data = response.json()
+    
+    # 4. Correct Path to the generated text
+    try:
+        return data['candidates'][0]['content']['parts'][0]['text']
+    except (KeyError, IndexError):
+        return "AI returned an unexpected response structure."
+
+def run_sql_ai_inspection(
+    column_search: str,
+    query: str,
+    cte_sql_map: dict[str, str],
+    lineage: dict,
+    final_lineage: list[dict],
+    deps: dict,
+    duplicate_notes: dict[str, list[str]],
+    api_key: str = None,
+) -> str:
+    docs = build_ai_documents(column_search, query, cte_sql_map, lineage, final_lineage, deps, duplicate_notes)
+    relevant_docs = retrieve_relevant_documents(docs, column_search or query)
+    prompt = build_ai_prompt(column_search, query, relevant_docs, duplicate_notes)
+    try:
+        return call_gemini_api(prompt, api_key=api_key)
+    except Exception as exc:
+        return (
+            "AI assistant could not be reached. "
+            "Check GEMINI_API_KEY and internet connectivity.\n"
+            f"Error: {exc}"
+        )
 
 
 def cte_complexity_score(sql: str) -> int:
@@ -440,7 +639,57 @@ all_columns: list[str] = sorted({
     for col in cols
     if col.get("output")
 })
+def build_optimized_ai_docs(column_search, lineage, deps, cte_sql_map, duplicate_notes):
+    """Only includes CTEs that are part of the column's upstream/downstream path."""
+    docs = []
+    
+    # Identify relevant CTEs using the dependency graph
+    matched_ctes = get_ctes_with_column(lineage, column_search)
+    # Get all ancestors and descendants of matched nodes to provide full context
+    relevant_nodes = get_dependency_subgraph(create_graph(deps), matched_ctes)
 
+    for node in relevant_nodes:
+        if node in cte_sql_map:
+            sql_snippet = cte_sql_map[node]
+            # Truncate if extremely long, or focus on the SELECT part
+            docs.append({
+                "id": f"cte:{node}",
+                "title": f"CTE: {node}",
+                "text": f"SQL:\n{sql_snippet}\nLineage: {lineage.get(node, [])}"
+            })
+            
+    # Add duplicate notes only for relevant CTEs
+    relevant_notes = {k: v for k, v in duplicate_notes.items() if k in relevant_nodes}
+    if relevant_notes:
+        docs.append({
+            "id": "alerts",
+            "title": "Logic Alerts",
+            "text": str(relevant_notes)
+        })
+        
+    return docs
+def build_structured_prompt(user_issue, column_search, docs):
+    context_text = "\n\n".join([f"--- {d['title']} ---\n{d['text']}" for d in docs])
+    
+    return f"""
+You are a Senior Data Engineer specializing in SQL Performance and Lineage.
+USER ISSUE: {user_issue}
+TARGET COLUMN: {column_search}
+
+CONTEXT:
+{context_text}
+
+TASK:
+1. Identify the specific CTE where the data mismatch or duplication occurs.
+2. Explain WHY it is happening (e.g., Fan-out join, missing GROUP BY, or alias collision).
+3. Provide a corrected SQL snippet for that specific CTE.
+
+RESPONSE FORMAT:
+- **Root Cause**: [Brief explanation]
+- **Location**: [CTE Name]
+- **Suggested Fix**: [SQL Snippet]
+- **Verification**: [How to test the fix]
+"""
 
 # ═══════════════════════════════════════════════════════════════
 # COLUMN SEARCH BAR
@@ -839,64 +1088,46 @@ with tab6:
 
 # ── TAB 7: Debugger ───────────────────────────────────────────
 with tab7:
-    st.subheader("🛠 Debugger — Column & Duplicate Inspector")
-
+    st.subheader("🛠 AI-Powered Root Cause Analysis")
+    
     if not column_search:
-        st.info("Search a column above to inspect where it appears and any duplicate risks.")
+        st.info("🔍 Please select a column in the search bar first to focus the AI.")
     else:
-        if matched_ctes:
-            st.markdown(
-                f"**Tracked column:** `{column_search}` appears in {len(matched_ctes)} CTE(s): "
-                + ", ".join(f"`{cte}`" for cte in sorted(matched_ctes))
-            )
-        else:
-            st.warning(f"No CTEs contain `{column_search}`.")
+        # User input for the specific problem
+        user_issue = st.text_area(
+            "Describe the issue (e.g., 'Values are duplicated' or 'Wrong calculation')",
+            placeholder="Help the AI understand what looks wrong...",
+            key="user_issue_input"
+        )
+        
+        # API Key Management
+        api_key = st.session_state.get("gemini_api_key") or os.getenv("GEMINI_API_KEY")
+        
+        if st.button("🚀 Analyze with Gemini", type="primary"):
+            if not api_key:
+                st.error("Missing Gemini API Key.")
+            elif not user_issue:
+                st.warning("Please describe the issue you are seeing.")
+            else:
+                with st.spinner("Analyzing lineage paths and SQL logic..."):
+                    # 1. Build tight context
+                    docs = build_optimized_ai_docs(
+                        column_search, lineage, deps, cte_sql_map, duplicate_notes
+                    )
+                    
+                    # 2. Build Prompt
+                    prompt = build_structured_prompt(user_issue, column_search, docs)
+                    
+                    # 3. Call API
+                    try:
+                        suggestion = call_gemini_api(prompt, api_key=api_key)
+                        st.markdown("### 💡 AI Suggestions")
+                        st.markdown(suggestion)
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
 
+        # Summary of risks (Always visible)
         if duplicate_ctes:
-            st.markdown("### 🟠 Duplicate risk candidates")
-            for cte in sorted(duplicate_ctes):
-                notes = duplicate_notes.get(cte, [])
-                st.markdown(f"- `{cte}`")
-                for note in notes:
-                    st.markdown(f"  - {note}")
-        else:
-            st.success("✅ No duplicate-risk CTEs or repeated output columns detected.")
-
-        st.markdown("---")
-        st.markdown("### 🧠 Column Debugger")
-
-        for cte, cols in lineage.items():
-            matches = [
-                col for col in cols
-                if column_search.lower() in col.get("output", "").lower()
-                or any(column_search.lower() in str(s).lower() for s in col.get("sources", []))
-            ]
-            if not matches:
-                continue
-            st.markdown(f"#### `{cte}`")
-            for col in matches:
-                st.markdown(f"- `{col['output']}` ← {col['sources']}")
-            if cte in cte_sql_map:
-                with st.expander(f"📄 Full SQL for `{cte}`"):
-                    st.code(highlight_column(cte_sql_map[cte], column_search), language="sql")
-                    risk = detect_duplicate_risk(cte_sql_map[cte])
-                    if risk: st.warning(risk)
-                    joins = extract_joins(cte_sql_map[cte])
-                    if joins:
-                        st.markdown("**Joins detected:**")
-                        for j in joins: st.code(j, language="sql")
-
-        if duplicate_ctes:
-            st.markdown("---")
-            st.markdown("### 🔶 Duplicate-risk nodes in dependency graph")
-            html_path = interactive_graph(
-                deps,
-                ctes=ctes,
-                cte_sql_map=cte_sql_map,
-                search_column=column_search,
-                highlight_nodes=subgraph_nodes,
-                matched_nodes=matched_ctes,
-                duplicate_nodes=duplicate_ctes,
-            )
-            with open(html_path, "r", encoding="utf-8") as f:
-                st.components.v1.html(f.read(), height=680, scrolling=False)
+            with st.expander("⚠️ System Detected Risks", expanded=True):
+                for cte in duplicate_ctes:
+                    st.write(f"**{cte}**: {', '.join(duplicate_notes[cte])}")

@@ -4,3 +4,7 @@ networkx
 pyvis
 regex
 sqlglot
+pandas
+requests
+chromadb
+sentence-transformers
