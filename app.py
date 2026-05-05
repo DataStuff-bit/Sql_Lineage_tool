@@ -679,13 +679,30 @@ if query not in st.session_state.query_history:
 @st.cache_data(show_spinner="Parsing query…")
 def run_analysis(query: str):
     parsed = parse_query(query)
-    ctes   = extract_ctes(parsed)
-    deps   = build_dependencies(ctes)
-    cte_sql_map = {name: expr.sql(pretty=True) for name, expr in ctes.items()}
+ 
+    if parsed is None:
+        raise ValueError("Could not parse SQL. Check syntax and try again.")
+ 
+    ctes  = extract_ctes(parsed)
+    deps  = build_dependencies(ctes)
+ 
+    # ✅ Fixed — handles dict values from new extractor
+    cte_sql_map = {}
+    for name, expr in ctes.items():
+        if isinstance(expr, dict):
+            cte_sql_map[name] = expr.get("body", "")
+        elif hasattr(expr, "sql"):
+            try:
+                cte_sql_map[name] = expr.sql(pretty=True)
+            except Exception:
+                cte_sql_map[name] = str(expr)
+        else:
+            cte_sql_map[name] = str(expr)
+ 
     lineage, final_lineage = build_lineage(ctes, parsed)
     return parsed, ctes, deps, cte_sql_map, lineage, final_lineage
-
-
+ 
+ 
 try:
     parsed, ctes, deps, cte_sql_map, lineage, final_lineage = run_analysis(query)
     duplicate_ctes, duplicate_notes = find_duplicate_ctes(lineage, cte_sql_map)
@@ -693,21 +710,21 @@ except Exception as e:
     st.error("❌ Error parsing SQL query")
     with st.expander("Details"): st.exception(e)
     st.stop()
-
+ 
 G = create_graph(deps)
-
+ 
 all_columns: list = sorted({
     col.get("output", "")
     for cols in lineage.values()
     for col in cols
     if col.get("output")
 })
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════
 # COLUMN SEARCH BAR
 # ═══════════════════════════════════════════════════════════════
-
+ 
 st.markdown("---")
 st.markdown("### 🔍 Column Search")
 s_col, c_col = st.columns([5, 1])
@@ -720,10 +737,10 @@ with s_col:
 with c_col:
     if st.button("✕ Clear", use_container_width=True):
         column_search = ""
-
+ 
 matched_ctes: set = set()
 subgraph_nodes: set = set()
-
+ 
 if column_search:
     matched_ctes   = get_ctes_with_column(lineage, column_search)
     subgraph_nodes = get_dependency_subgraph(G, matched_ctes)
@@ -732,12 +749,12 @@ if column_search:
                    + ", ".join(f"`{c}`" for c in sorted(matched_ctes)))
     else:
         st.warning(f"No CTEs contain a column matching **'{column_search}'**.")
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════
 # SUMMARY METRICS
 # ═══════════════════════════════════════════════════════════════
-
+ 
 st.markdown("---")
 st.markdown("### 📊 Query Summary")
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -746,7 +763,7 @@ c2.metric("Dependencies",    sum(len(v) for v in deps.values()))
 c3.metric("Final Columns",   len(final_lineage))
 c4.metric("Matched CTEs",    len(matched_ctes) if column_search else "—")
 c5.metric("Duplicate Risks", len(duplicate_ctes) if duplicate_ctes else "✅ 0")
-
+ 
 if cte_sql_map:
     st.markdown("**CTE Complexity Scores**")
     scores = {name: cte_complexity_score(sql) for name, sql in cte_sql_map.items()}
@@ -754,7 +771,7 @@ if cte_sql_map:
     for i, (name, score) in enumerate(sorted(scores.items(), key=lambda x: -x[1])):
         badge = "🔴" if score >= 5 else "🟡" if score >= 2 else "🟢"
         cols_complexity[i % 6].metric(f"{badge} {name}", f"score {score}")
-
+ 
 try:
     execution_order = list(nx.topological_sort(G))
     st.markdown("**Execution Flow:**")
@@ -769,14 +786,14 @@ try:
     st.markdown(" → ".join(flow_parts))
 except Exception:
     st.warning("⚠️ Cycle detected — could not determine execution order.")
-
+ 
 st.markdown("---")
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════
-# TABS  (8 tabs — Tab 8 is the new Cross-File Tracker)
+# TABS
 # ═══════════════════════════════════════════════════════════════
-
+ 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📌 CTE Breakdown",
     "🔗 Dependency Graph",
@@ -785,10 +802,10 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🧭 Column Dependency",
     "📊 Row Counter",
     "🛠 Debugger",
-    "📁 Cross-File Tracker",   # ← NEW
+    "📁 Cross-File Tracker",
 ])
-
-
+ 
+ 
 # ── TAB 1: CTE Breakdown ─────────────────────────────────────
 with tab1:
     st.subheader("CTE Step-by-Step View")
@@ -799,38 +816,64 @@ with tab1:
         with t1_left:
             show_all = st.toggle("Show all CTEs", value=not bool(column_search))
         with t1_right:
-            sort_by = st.selectbox("Sort by", ["Definition order", "Complexity", "Name"], label_visibility="collapsed")
-
+            sort_by = st.selectbox(
+                "Sort by",
+                ["Definition order", "Complexity", "Name"],
+                label_visibility="collapsed",
+            )
+ 
         cte_items = list(ctes.items())
         if sort_by == "Complexity":
-            cte_items = sorted(cte_items, key=lambda x: -cte_complexity_score(cte_sql_map.get(x[0], "")))
+            cte_items = sorted(
+                cte_items,
+                key=lambda x: -cte_complexity_score(cte_sql_map.get(x[0], "")),
+            )
         elif sort_by == "Name":
             cte_items = sorted(cte_items, key=lambda x: x[0])
-
+ 
         for i, (name, expr) in enumerate(cte_items, start=1):
             is_matched  = name in matched_ctes
             is_dup      = name in duplicate_ctes
             in_subgraph = name in subgraph_nodes
-            if column_search and not show_all and not in_subgraph: continue
+ 
+            if column_search and not show_all and not in_subgraph:
+                continue
+ 
             badges = []
-            if is_matched: badges.append("🟡 Column match")
-            if is_dup:     badges.append("🟠 Dup risk")
+            if is_matched:                    badges.append("🟡 Column match")
+            if is_dup:                        badges.append("🟠 Dup risk")
             if in_subgraph and not is_matched: badges.append("🔵 Related")
             score = cte_complexity_score(cte_sql_map.get(name, ""))
-            badges.append(f"{'🔴' if score>=5 else '🟡' if score>=2 else '🟢'} complexity {score}")
-            with st.expander(f"Step {i}: `{name}`  {'  '.join(badges)}", expanded=is_matched):
-                st.code(expr.sql(), language="sql")
+            badges.append(
+                f"{'🔴' if score >= 5 else '🟡' if score >= 2 else '🟢'} complexity {score}"
+            )
+ 
+            with st.expander(
+                f"Step {i}: `{name}`  {'  '.join(badges)}",
+                expanded=is_matched,
+            ):
+                # ✅ Fixed — use cte_sql_map (already a plain string)
+                #    never call expr.sql() — expr may be a dict now
+                st.code(cte_sql_map.get(name, "-- body not available"), language="sql")
+ 
                 if is_matched and column_search:
-                    matching_cols = [col for col in lineage.get(name, [])
-                        if column_search.lower() in col.get("output","").lower()
-                        or any(column_search.lower() in str(s).lower() for s in col.get("sources",[]))]
+                    matching_cols = [
+                        col for col in lineage.get(name, [])
+                        if column_search.lower() in col.get("output", "").lower()
+                        or any(
+                            column_search.lower() in str(s).lower()
+                            for s in col.get("sources", [])
+                        )
+                    ]
                     if matching_cols:
                         st.markdown("**Matched columns:**")
                         for col in matching_cols:
                             st.markdown(f"- `{col['output']}` ← `{col['sources']}`")
+ 
                 if is_dup and name in duplicate_notes:
-                    st.warning("Duplicate risk: " + "; ".join(duplicate_notes[name]))
-
+                    st.warning(
+                        "Duplicate risk: " + "; ".join(duplicate_notes[name])
+                    )
 
 # ── TAB 2: Dependency Graph ───────────────────────────────────
 with tab2:
