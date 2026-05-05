@@ -5,20 +5,24 @@ def extract_ctes(sql):
     registry = {}
 
     try:
-        parsed_list = sqlglot.parse(sql)
-    except Exception:
+        parsed = sqlglot.parse_one(sql, read="snowflake")
+    except Exception as e:
+        print("Parse error:", e)
         return {}
 
-    for parsed in parsed_list:
-        if not parsed:
+    if not parsed:
+        return {}
+
+    for cte in parsed.find_all(exp.CTE):
+        alias = cte.alias
+        name = alias.this if alias else None
+
+        if not name:
             continue
 
-        for cte in parsed.find_all(exp.CTE):
-            name = cte.alias_or_name
-
-            registry[name.lower()] = {
-                "line": 0,
-                "body": cte.this.sql() if cte.this else ""
-            }
+        registry[name.lower()] = {
+            "line": 0,
+            "body": cte.this.sql(dialect="snowflake") if cte.this else ""
+        }
 
     return registry
