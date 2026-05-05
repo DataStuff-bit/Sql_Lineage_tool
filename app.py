@@ -165,16 +165,70 @@ def get_dependency_subgraph(G: nx.DiGraph, highlight_ctes: set) -> set:
     return related
 
 
-def find_duplicate_ctes(lineage: dict, cte_sql_map: dict) -> tuple:
-    duplicate_ctes: set = set()
-    duplicate_notes: dict = {}
+# def find_duplicate_ctes(lineage: dict, cte_sql_map: dict) -> tuple:
+#     duplicate_ctes: set = set()
+#     duplicate_notes: dict = {}
 
+#     for cte, cols in lineage.items():
+#         alias_counts: dict = {}
+#         for col in cols:
+#             output = str(col.get("output", "")).strip().lower()
+#             if not output: continue
+#             alias_counts[output] = alias_counts.get(output, 0) + 1
+#         for alias, count in alias_counts.items():
+#             if count > 1:
+#                 duplicate_ctes.add(cte)
+#                 duplicate_notes.setdefault(cte, []).append(
+#                     f"Column alias `{alias}` appears {count}x in `{cte}`."
+#                 )
+
+#     output_map: dict = {}
+#     for cte, cols in lineage.items():
+#         for col in cols:
+#             output = str(col.get("output", "")).strip().lower()
+#             if not output: continue
+#             output_map.setdefault(output, set()).add(cte)
+#     for output, ctes_with_output in output_map.items():
+#         if len(ctes_with_output) > 1:
+#             note = (
+#                 f"Output `{output}` produced by multiple CTEs: "
+#                 + ", ".join(sorted(ctes_with_output))
+#             )
+#             for cte in ctes_with_output:
+#                 duplicate_ctes.add(cte)
+#                 duplicate_notes.setdefault(cte, []).append(note)
+
+#     for cte, sql in cte_sql_map.items():
+#         risk = detect_duplicate_risk(sql)
+#         if risk:
+#             duplicate_ctes.add(cte)
+#             duplicate_notes.setdefault(cte, []).append(risk)
+
+#     return duplicate_ctes, duplicate_notes
+
+
+# def cte_complexity_score(sql: str) -> int:
+#     sql_up = sql.upper()
+#     score = 0
+#     score += sql_up.count(" JOIN ")
+#     score += sql_up.count("SELECT", 1)
+#     score += sql_up.count("CASE ")
+#     score += sql_up.count("OVER (") + sql_up.count("OVER(")
+#     score += sql_up.count("GROUP BY")
+#     return score
+
+def find_duplicate_ctes(lineage: dict, cte_sql_map: dict) -> tuple:
+    duplicate_ctes = set()
+    duplicate_notes = {}
+
+    # 1. Check for Duplicate Aliases within the same CTE
     for cte, cols in lineage.items():
-        alias_counts: dict = {}
+        alias_counts = {}
         for col in cols:
             output = str(col.get("output", "")).strip().lower()
             if not output: continue
             alias_counts[output] = alias_counts.get(output, 0) + 1
+        
         for alias, count in alias_counts.items():
             if count > 1:
                 duplicate_ctes.add(cte)
@@ -182,23 +236,33 @@ def find_duplicate_ctes(lineage: dict, cte_sql_map: dict) -> tuple:
                     f"Column alias `{alias}` appears {count}x in `{cte}`."
                 )
 
-    output_map: dict = {}
+    # 2. Check for Global Output Collisions (Same alias in different CTEs)
+    output_map = {}
     for cte, cols in lineage.items():
         for col in cols:
             output = str(col.get("output", "")).strip().lower()
             if not output: continue
             output_map.setdefault(output, set()).add(cte)
+            
     for output, ctes_with_output in output_map.items():
         if len(ctes_with_output) > 1:
-            note = (
-                f"Output `{output}` produced by multiple CTEs: "
-                + ", ".join(sorted(ctes_with_output))
-            )
+            note = f"Output `{output}` produced by multiple CTEs: {', '.join(sorted(ctes_with_output))}"
             for cte in ctes_with_output:
                 duplicate_ctes.add(cte)
                 duplicate_notes.setdefault(cte, []).append(note)
 
+    # 3. Check for Self-Joins and Self-Dependencies
     for cte, sql in cte_sql_map.items():
+        # Identify if the CTE name appears in its own FROM/JOIN clause
+        # Using regex to ensure we match the whole word and not substrings
+        pattern = rf"\bFROM\s+{re.escape(cte)}\b|\bJOIN\s+{re.escape(cte)}\b"
+        if re.search(pattern, sql, re.IGNORECASE):
+            duplicate_ctes.add(cte)
+            duplicate_notes.setdefault(cte, []).append(
+                f"Self-dependency detected: `{cte}` references itself in its own definition."
+            )
+
+        # Existing risk detection
         risk = detect_duplicate_risk(sql)
         if risk:
             duplicate_ctes.add(cte)
@@ -206,18 +270,40 @@ def find_duplicate_ctes(lineage: dict, cte_sql_map: dict) -> tuple:
 
     return duplicate_ctes, duplicate_notes
 
-
-def cte_complexity_score(sql: str) -> int:
+def cte_complexity_score(sql: str, cte_name: str = None) -> int:
+    if not sql:
+        return 0
+        
     sql_up = sql.upper()
     score = 0
-    score += sql_up.count(" JOIN ")
-    score += sql_up.count("SELECT", 1)
-    score += sql_up.count("CASE ")
-    score += sql_up.count("OVER (") + sql_up.count("OVER(")
-    score += sql_up.count("GROUP BY")
+    
+    # Define keywords and their respective weights
+    # We use \b (word boundary) to prevent matching "JOINED" or "SELECTIVE"
+    metrics = {
+        r"\bJOIN\b": 2,
+        r"\bCASE\b": 1,
+        r"\bOVER\s*\(": 3,       # Window functions are complex
+        r"\bGROUP\s+BY\b": 2,
+        r"\bUNION\b": 3,          # Unions double complexity
+        r"\bDISTINCT\b": 1,
+        r"\bHAVING\b": 2
+    }
+    
+    for pattern, weight in metrics.items():
+        score += len(re.findall(pattern, sql_up)) * weight
+        
+    # Count subqueries: Every SELECT after the first one
+    select_count = len(re.findall(r"\bSELECT\b", sql_up))
+    if select_count > 1:
+        score += (select_count - 1) * 2
+
+    # Add extra weight for Self-Joins if the name is provided
+    if cte_name:
+        self_ref_pattern = rf"\bJOIN\s+{re.escape(cte_name.upper())}\b"
+        if re.search(self_ref_pattern, sql_up):
+            score += 5  # High penalty for self-join complexity
+
     return score
-
-
 # ═══════════════════════════════════════════════════════════════
 # CROSS-FILE CTE TRACKER HELPERS  (Tab 8)
 # ═══════════════════════════════════════════════════════════════
@@ -764,30 +850,30 @@ c3.metric("Final Columns",   len(final_lineage))
 c4.metric("Matched CTEs",    len(matched_ctes) if column_search else "—")
 c5.metric("Duplicate Risks", len(duplicate_ctes) if duplicate_ctes else "✅ 0")
  
-if cte_sql_map:
-    st.markdown("**CTE Complexity Scores**")
-    scores = {name: cte_complexity_score(sql) for name, sql in cte_sql_map.items()}
-    cols_complexity = st.columns(min(len(scores), 6))
-    for i, (name, score) in enumerate(sorted(scores.items(), key=lambda x: -x[1])):
-        badge = "🔴" if score >= 5 else "🟡" if score >= 2 else "🟢"
-        cols_complexity[i % 6].metric(f"{badge} {name}", f"score {score}")
+# if cte_sql_map:
+#     st.markdown("**CTE Complexity Scores**")
+#     scores = {name: cte_complexity_score(sql) for name, sql in cte_sql_map.items()}
+#     cols_complexity = st.columns(min(len(scores), 6))
+#     for i, (name, score) in enumerate(sorted(scores.items(), key=lambda x: -x[1])):
+#         badge = "🔴" if score >= 5 else "🟡" if score >= 2 else "🟢"
+#         cols_complexity[i % 6].metric(f"{badge} {name}", f"score {score}")
  
-try:
-    execution_order = list(nx.topological_sort(G))
-    st.markdown("**Execution Flow:**")
-    flow_parts = []
-    for node in execution_order:
-        if node in matched_ctes or node in duplicate_ctes:
-            flow_parts.append(f"**:orange[{node}]**")
-        elif node in subgraph_nodes:
-            flow_parts.append(f"**{node}**")
-        else:
-            flow_parts.append(f":gray[{node}]" if column_search else node)
-    st.markdown(" → ".join(flow_parts))
-except Exception:
-    st.warning("⚠️ Cycle detected — could not determine execution order.")
+# try:
+#     execution_order = list(nx.topological_sort(G))
+#     st.markdown("**Execution Flow:**")
+#     flow_parts = []
+#     for node in execution_order:
+#         if node in matched_ctes or node in duplicate_ctes:
+#             flow_parts.append(f"**:orange[{node}]**")
+#         elif node in subgraph_nodes:
+#             flow_parts.append(f"**{node}**")
+#         else:
+#             flow_parts.append(f":gray[{node}]" if column_search else node)
+#     st.markdown(" → ".join(flow_parts))
+# except Exception:
+#     st.warning("⚠️ Cycle detected — could not determine execution order.")
  
-st.markdown("---")
+# st.markdown("---")
  
  
 # ═══════════════════════════════════════════════════════════════
